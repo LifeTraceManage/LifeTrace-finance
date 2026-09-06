@@ -52,9 +52,9 @@ void main() {
       expect(completed, [1, 2, 3, 4]);
     });
 
-    test('rejects invalid concurrency', () {
-      expect(
-        () => BoundedAsyncRunner.run<int, int>(
+    test('rejects invalid concurrency', () async {
+      await expectLater(
+        BoundedAsyncRunner.run<int, int>(
           items: [1],
           concurrency: 0,
           task: (item, index) async => item,
