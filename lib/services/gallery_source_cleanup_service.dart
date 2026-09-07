@@ -1,7 +1,6 @@
 import 'dart:io';
 
 import 'package:crypto/crypto.dart';
-import 'package:path/path.dart' as path;
 import 'package:photo_manager/photo_manager.dart';
 
 import 'system/logger_service.dart';
@@ -44,13 +43,14 @@ class GallerySourceCleanupResult {
   int get deleteFailedCount => matchedCount - deletedCount;
 }
 
-/// 将 image_picker 返回的“精确缓存副本”反查到系统相册资源，再通过
-/// photo_manager 请求系统删除。
+/// 将 image_picker 返回的“精确缓存副本”反查到系统相册资源，再请求系统删除。
 ///
-/// 为什么不能直接 `File.delete()`：image_picker 在 Android 上会把 Photo Picker
-/// 返回的 content:// URI 复制到 App cache，File.path 指向缓存，不是系统相册原图。
-/// 本服务通过 文件名 + 文件大小 + SHA256 三重匹配 AssetEntity，避免仅靠文件名
-/// 误删同名照片。
+/// 为什么不能直接 `File.delete()`：Android Photo Picker 会把 content:// 媒体复制
+/// 到 App cache，XFile.path 通常指向缓存，不是系统相册原图。
+///
+/// 这里不依赖缓存文件名，因为缓存名不保证等于相册原始文件名。先按文件大小
+/// 初筛，再对候选 AssetEntity 的原始内容计算 SHA-256，只有内容完全一致才删除。
+/// 找不到精确匹配时宁可保留，不做任何模糊删除。
 class GallerySourceCleanupService {
   static const String _tag = 'GallerySourceCleanup';
   static const int _pageSize = 200;
@@ -68,7 +68,7 @@ class GallerySourceCleanupService {
       );
     }
 
-    // 当前项目主要在 Android 使用该能力；其它平台先保持原图，不做破坏性操作。
+    // 当前功能只在 Android 开启。其它平台保留原图，避免引入未经验证的删除语义。
     if (!Platform.isAndroid) {
       return GallerySourceCleanupResult(
         requestedCount: exactSourceCopies.length,
@@ -131,19 +131,13 @@ class GallerySourceCleanupService {
         for (final asset in assets) {
           if (unresolved.isEmpty) break;
 
-          final title = asset.title ?? await asset.titleAsync;
-          final sameNameIndexes = unresolved
-              .where((i) => fingerprints[i].fileName == title)
-              .toList(growable: false);
-          if (sameNameIndexes.isEmpty) continue;
-
           final assetSize = await asset.fileSize;
-          final sameSizeIndexes = sameNameIndexes
+          final sameSizeIndexes = unresolved
               .where((i) => fingerprints[i].size == assetSize)
               .toList(growable: false);
           if (sameSizeIndexes.isEmpty) continue;
 
-          // 文件名和大小都一致仍可能存在重复文件，最后用内容哈希确认。
+          // 大小相同仍可能是不同图片，必须再做内容哈希确认。
           final assetFile = await asset.originFile ?? await asset.file;
           if (assetFile == null || !await assetFile.exists()) continue;
           final assetDigest = await _sha256Of(assetFile);
@@ -167,7 +161,7 @@ class GallerySourceCleanupService {
         );
       }
 
-      // Android 11+ photo_manager 会走系统确认/回收站语义；用户拒绝时返回空列表。
+      // Android 11+ 由系统负责删除确认/回收站语义。用户拒绝时不会强制删除。
       final deletedIds = await PhotoManager.editor.deleteWithIds(matchedIds);
       logger.info(
         _tag,
@@ -181,7 +175,7 @@ class GallerySourceCleanupService {
         deletedCount: deletedIds.length,
       );
     } catch (e, st) {
-      // 删除失败绝不能影响已经完成的记账，也不能尝试降级为 File.delete()。
+      // 删除失败绝不能影响已经完成的记账，也不能降级为 File.delete()。
       logger.error(_tag, '删除系统相册原截图失败，已保留原图', e, st);
       return GallerySourceCleanupResult(
         requestedCount: exactSourceCopies.length,
@@ -193,19 +187,16 @@ class GallerySourceCleanupService {
 }
 
 class _SourceFingerprint {
-  final String fileName;
   final int size;
   final String sha256;
 
   const _SourceFingerprint({
-    required this.fileName,
     required this.size,
     required this.sha256,
   });
 
   static Future<_SourceFingerprint> fromFile(File file) async {
     return _SourceFingerprint(
-      fileName: path.basename(file.path),
       size: await file.length(),
       sha256: await _sha256Of(file),
     );
