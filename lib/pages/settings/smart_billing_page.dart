@@ -208,6 +208,9 @@ class SmartBillingPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final l10n = AppLocalizations.of(context);
 
+    // 该开关默认关闭且持久化。进入本页时先恢复历史设置，避免 UI 先显示默认值。
+    ref.watch(smartBillingDeleteSourceAfterImportInitProvider);
+
     return Scaffold(
       backgroundColor: BeeTokens.scaffoldBackground(context),
       body: Column(
@@ -391,9 +394,37 @@ class SmartBillingPage extends ConsumerWidget {
                           activeColor: ref.watch(primaryColorProvider),
                           onChanged: (value) {
                             ref.read(smartBillingAutoAttachmentProvider.notifier).state = value;
+                            // 没有应用内附件副本时绝不允许清理相册原图。
+                            if (!value) {
+                              ref
+                                  .read(smartBillingDeleteSourceAfterImportProvider.notifier)
+                                  .state = false;
+                            }
                           },
                         ),
                       ),
+                      // Google Play 版不提供该能力，避免为了删图引入广泛媒体权限。
+                      if (Platform.isAndroid && !_isGooglePlayBuild) ...[
+                        BeeTokens.cardDivider(context),
+                        AppListTile(
+                          leading: Icons.delete_sweep_outlined,
+                          title: _deleteSourceSettingTitle(context),
+                          subtitle: _deleteSourceSettingSubtitle(context),
+                          enabled: ref.watch(smartBillingAutoAttachmentProvider),
+                          trailing: Switch.adaptive(
+                            value: ref.watch(smartBillingAutoAttachmentProvider) &&
+                                ref.watch(smartBillingDeleteSourceAfterImportProvider),
+                            activeColor: ref.watch(primaryColorProvider),
+                            onChanged: ref.watch(smartBillingAutoAttachmentProvider)
+                                ? (value) {
+                                    ref
+                                        .read(smartBillingDeleteSourceAfterImportProvider.notifier)
+                                        .state = value;
+                                  }
+                                : null,
+                          ),
+                        ),
+                      ],
                     ],
                   ),
                 ),
@@ -408,6 +439,28 @@ class SmartBillingPage extends ConsumerWidget {
         ],
       ),
     );
+  }
+}
+
+String _deleteSourceSettingTitle(BuildContext context) {
+  switch (Localizations.localeOf(context).languageCode) {
+    case 'zh':
+      return '成功记账后清理原截图';
+    case 'ko':
+      return '기록 후 원본 스크린샷 정리';
+    default:
+      return 'Clean up source screenshots';
+  }
+}
+
+String _deleteSourceSettingSubtitle(BuildContext context) {
+  switch (Localizations.localeOf(context).languageCode) {
+    case 'zh':
+      return '仅在账单和应用内附件都保存成功后询问删除，相册原图不会自动静默删除';
+    case 'ko':
+      return '거래와 앱 첨부파일 저장에 모두 성공한 경우에만 원본 삭제를 확인합니다';
+    default:
+      return 'Ask to delete originals only after the bill and app attachment are safely saved';
   }
 }
 

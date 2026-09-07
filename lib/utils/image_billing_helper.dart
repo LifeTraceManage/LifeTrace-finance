@@ -14,9 +14,13 @@ import '../services/ai/bookkeeping_result.dart';
 import '../services/attachment_service.dart';
 import '../services/billing/post_processor.dart';
 import '../services/data/tag_seed_service.dart';
+import '../services/gallery_source_cleanup_service.dart';
 import '../services/system/logger_service.dart';
 import '../widgets/ui/ui.dart';
 import 'bounded_async_runner.dart';
+
+/// Google Play 构建不开放原图清理能力，避免为了删图引入广泛媒体权限。
+const _isGooglePlayBuild = bool.fromEnvironment('GOOGLE_PLAY', defaultValue: false);
 
 /// 图片记账入口(相册/相机)。
 ///
@@ -36,11 +40,12 @@ class ImageBillingHelper {
   ) async {
     final l10n = AppLocalizations.of(context);
     try {
+      // 不在 picker 阶段缩放/压缩：image_picker 返回的是系统相册资源的缓存
+      // 副本，后续安全删除原图需要用它的原始大小 + SHA256 精确反查相册资源。
+      // 应用内附件仍由 AttachmentService 单独压缩，不会因此膨胀长期存储。
       final pickedFiles = await ImagePicker().pickMultiImage(
-        maxWidth: 1920,
-        maxHeight: 1920,
-        imageQuality: 85,
         limit: _maxGalleryImages,
+        requestFullMetadata: false,
       );
       if (pickedFiles.isEmpty || !context.mounted) return;
       await _processPickedImages(
@@ -117,6 +122,19 @@ class ImageBillingHelper {
       if (!context.mounted) return;
 
       final autoAddAttachment = ref.read(smartBillingAutoAttachmentProvider);
+
+      // 删除设置按需恢复：用户即使重启 App 后没有进入设置页，也要读取之前保存
+      // 的偏好。没有自动附件时强制关闭清理，确保删除相册原图后应用内仍有副本。
+      var cleanupSourceEnabled = false;
+      if (source == ImageSource.gallery &&
+          Platform.isAndroid &&
+          !_isGooglePlayBuild &&
+          autoAddAttachment) {
+        await ref.read(smartBillingDeleteSourceAfterImportInitProvider.future);
+        cleanupSourceEnabled =
+            ref.read(smartBillingDeleteSourceAfterImportProvider);
+      }
+
       final billingTypes = <String>[
         source == ImageSource.gallery
             ? TagSeedService.billingTypeImage
@@ -142,12 +160,16 @@ class ImageBillingHelper {
       dialogOpen = true;
 
       // 4. 每张图片独立调用现有单图识别链路，默认最多并发 2 个请求。
-      final outcomes = await BoundedAsyncRunner.run<XFile, BookkeepingResult>(
+      final outcomes =
+          await BoundedAsyncRunner.run<XFile, _ImageBillingTaskOutcome>(
         items: pickedFiles,
         concurrency: pickedFiles.length == 1 ? 1 : _batchConcurrency,
         task: (pickedFile, index) async {
           final imageFile = File(pickedFile.path);
-          return bookkeeper.fromImage(
+          var attachmentAttempts = 0;
+          var attachmentSuccesses = 0;
+
+          final result = await bookkeeper.fromImage(
             image: imageFile,
             ledgerId: currentLedger.id,
             billGuard: PromptBuilder.billGuardForImage,
@@ -155,17 +177,34 @@ class ImageBillingHelper {
             l10n: l10n,
             // 一张图识别出多笔时，每笔都挂原图，保持现有溯源语义。
             onSaved: autoAddAttachment
-                ? (txId, _) => attachmentService.saveAttachment(
+                ? (txId, _) async {
+                    attachmentAttempts++;
+                    final attachment = await attachmentService.saveAttachment(
                       transactionId: txId,
                       sourceFile: imageFile,
                       index: 0,
-                    )
+                    );
+                    if (attachment != null) attachmentSuccesses++;
+                  }
                 : null,
+          );
+
+          // 删除原图的关键门禁：账单保存成功不代表附件一定成功，因为
+          // AiBookkeeper 会隔离 onSaved 异常。必须确认每个成功账单都真正拿到了
+          // 应用内附件副本后，才允许把这张相册图加入删除候选。
+          final attachmentCopyReady = autoAddAttachment &&
+              result.savedCount > 0 &&
+              attachmentAttempts == result.savedCount &&
+              attachmentSuccesses == result.savedCount;
+
+          return _ImageBillingTaskOutcome(
+            result: result,
+            attachmentCopyReady: attachmentCopyReady,
           );
         },
         onProgress: (completed, total, taskResult) {
           final previous = progress!.value;
-          final result = taskResult.value;
+          final result = taskResult.value?.result;
           final failedDelta = taskResult.isFailure
               ? 1
               : (result?.failedCount ?? 0);
@@ -202,9 +241,12 @@ class ImageBillingHelper {
       if (!context.mounted) return;
 
       // 5. 聚合批量结果。一张截图本身可能返回多笔 BillInfo，因此按实际交易数汇总。
-      final successfulResults = outcomes
+      final successfulTaskOutcomes = outcomes
           .where((o) => o.value != null)
           .map((o) => o.value!)
+          .toList(growable: false);
+      final successfulResults = successfulTaskOutcomes
+          .map((o) => o.result)
           .toList(growable: false);
       final savedCount = successfulResults.fold<int>(
         0,
@@ -243,6 +285,36 @@ class ImageBillingHelper {
       );
       if (!context.mounted) return;
 
+      // 7. 只收集“整张图完全成功 + 每笔附件副本都成功”的删除候选。
+      // 识别失败、无账单、部分入账失败、附件失败的图片全部保留。
+      final cleanupCandidates = <File>[];
+      if (cleanupSourceEnabled) {
+        for (final outcome in outcomes) {
+          final value = outcome.value;
+          if (value == null) continue;
+          if (GalleryCleanupPolicy.canDeleteOriginal(
+            bookkeepingSucceeded: value.result.success,
+            failedBillCount: value.result.failedCount,
+            attachmentCopyReady: value.attachmentCopyReady,
+          )) {
+            cleanupCandidates.add(File(pickedFiles[outcome.index].path));
+          }
+        }
+      }
+
+      GallerySourceCleanupResult? cleanupResult;
+      if (cleanupCandidates.isNotEmpty && context.mounted) {
+        final confirmed = await _confirmDeleteOriginals(
+          context,
+          cleanupCandidates.length,
+        );
+        if (confirmed && context.mounted) {
+          cleanupResult = await const GallerySourceCleanupService()
+              .deleteOriginals(cleanupCandidates);
+        }
+      }
+      if (!context.mounted) return;
+
       final firstBill = successfulResults
           .expand((result) => result.savedBills)
           .first;
@@ -274,6 +346,9 @@ class ImageBillingHelper {
         toastText =
             '$toastText\n${l10n.aiBillingRateMissingHint(unconvertedCurrencies.join('、'))}';
       }
+      if (cleanupResult != null) {
+        toastText = '$toastText\n${_cleanupResultText(context, cleanupResult)}';
+      }
       showToast(context, toastText);
     } catch (e, st) {
       logger.error('ImageBilling', '图片记账批次异常', e, st);
@@ -290,6 +365,114 @@ class ImageBillingHelper {
       }
     }
   }
+
+  static Future<bool> _confirmDeleteOriginals(
+    BuildContext context,
+    int count,
+  ) async {
+    final l10n = AppLocalizations.of(context);
+    final result = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(_deleteDialogTitle(context)),
+        content: Text(_deleteDialogMessage(context, count)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: Text(l10n.commonCancel),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(
+              l10n.commonDelete,
+              style: const TextStyle(color: Colors.red),
+            ),
+          ),
+        ],
+      ),
+    );
+    return result == true;
+  }
+}
+
+class _ImageBillingTaskOutcome {
+  final BookkeepingResult result;
+  final bool attachmentCopyReady;
+
+  const _ImageBillingTaskOutcome({
+    required this.result,
+    required this.attachmentCopyReady,
+  });
+}
+
+String _deleteDialogTitle(BuildContext context) {
+  switch (Localizations.localeOf(context).languageCode) {
+    case 'zh':
+      return '删除原截图？';
+    case 'ko':
+      return '원본 스크린샷을 삭제할까요?';
+    default:
+      return 'Delete source screenshots?';
+  }
+}
+
+String _deleteDialogMessage(BuildContext context, int count) {
+  switch (Localizations.localeOf(context).languageCode) {
+    case 'zh':
+      return '这 $count 张截图已成功记账，并已保存为应用内账单附件。是否从系统相册删除原截图？'
+          '识别失败、入账失败或附件保存失败的图片不会删除。系统可能再次要求确认。';
+    case 'ko':
+      return '$count개의 스크린샷이 정상적으로 기록되고 앱 첨부파일로 저장되었습니다. '
+          '시스템 앨범의 원본을 삭제할까요? 실패한 이미지는 삭제하지 않습니다. '
+          '시스템에서 한 번 더 확인할 수 있습니다.';
+    default:
+      return '$count screenshot(s) were recorded successfully and safely copied into app attachments. '
+          'Delete the originals from the system gallery? Failed or incomplete images will be kept. '
+          'Android may ask for confirmation again.';
+  }
+}
+
+String _cleanupResultText(
+  BuildContext context,
+  GallerySourceCleanupResult result,
+) {
+  final language = Localizations.localeOf(context).languageCode;
+  if (result.permissionDenied) {
+    return language == 'zh'
+        ? '未获得相册权限，原截图已保留'
+        : (language == 'ko'
+            ? '앨범 권한이 없어 원본을 유지했습니다'
+            : 'Gallery permission was not granted; originals were kept');
+  }
+  if (result.unsupported) {
+    return language == 'zh'
+        ? '当前平台不支持删除相册原图，已保留'
+        : (language == 'ko'
+            ? '현재 플랫폼에서는 원본 삭제를 지원하지 않아 유지했습니다'
+            : 'Source cleanup is unsupported on this platform; originals were kept');
+  }
+  if (result.deletedCount > 0) {
+    final kept = result.requestedCount - result.deletedCount;
+    if (language == 'zh') {
+      return kept > 0
+          ? '已删除原截图 ${result.deletedCount} 张，另有 $kept 张未精确匹配或未获系统删除许可，已保留'
+          : '已删除原截图 ${result.deletedCount} 张';
+    }
+    if (language == 'ko') {
+      return kept > 0
+          ? '원본 ${result.deletedCount}개 삭제, $kept개는 안전하게 유지했습니다'
+          : '원본 스크린샷 ${result.deletedCount}개를 삭제했습니다';
+    }
+    return kept > 0
+        ? 'Deleted ${result.deletedCount} original(s); kept $kept unmatched or unapproved item(s)'
+        : 'Deleted ${result.deletedCount} source screenshot(s)';
+  }
+  return language == 'zh'
+      ? '未能精确匹配或系统未批准删除，原截图已保留'
+      : (language == 'ko'
+          ? '정확히 일치하지 않거나 시스템 승인이 없어 원본을 유지했습니다'
+          : 'No exact match was deleted; originals were kept');
 }
 
 class _BatchBillingProgress {
